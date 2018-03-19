@@ -115,3 +115,18 @@ func BenchmarkExponentBitLen(b *testing.B) {
 		})
 	}
 }
+
+// TODO: check quadratic residue
+
+func TestQuadraticResidues(t *testing.T) {
+	var r rune
+	for i, found := 0, 0; found < 106; i++ {
+		res := big.Jacobi(big.NewInt(int64(i)), defaultN)
+		r = ' '
+		if res == 1 {
+			r = '*'
+			found++
+		}
+		fmt.Printf("%d\t%s\t%d\n", i, string(r), res)
+	}
+}
