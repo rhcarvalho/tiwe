@@ -82,3 +82,9 @@ func (k *Key) Decrypt(m *Message) *Message {
 	stream.XORKeyStream(m.Bytes, m.Bytes)
 	return m
 }
+
+// CanDecrypt reports whether key can decrypt message.
+func (k *Key) CanDecrypt(m *Message) bool {
+	_, ok := m.Nonces[k.sum]
+	return ok
+}
