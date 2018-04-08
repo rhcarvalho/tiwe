@@ -179,13 +179,18 @@ func stateGameplayOrder3Compute(m *Machine) Fn {
 	return stateShuffleTiles
 }
 
+// xor returns the exclusive or of 8-byte arrays as an 8-byte slice.
+// It allocates memory for the result and does not mutate any of its input.
 func xor(ss ...[8]byte) []byte {
 	if len(ss) == 0 {
 		return nil
 	}
-	out := ss[0][:]
-	for i, s := range ss[1:] {
-		out[i] ^= s[i]
+	out := make([]byte, 8)
+	copy(out, ss[0][:])
+	for _, s := range ss[1:] {
+		for i := range out {
+			out[i] ^= s[i]
+		}
 	}
 	return out
 }
