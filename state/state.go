@@ -2,11 +2,12 @@
 package state
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
+	"sort"
 
-	"github.com/rhcarvalho/tiwe/crypto/commutative"
-	"github.com/rhcarvalho/tiwe/crypto/rand"
+	"golang.org/x/crypto/blake2b"
 )
 
 // MinPlayers is the minimum number of players in a game.
@@ -14,13 +15,12 @@ const MinPlayers = 2
 
 // A Message carries the input data that causes state transitions.
 type Message struct {
-	From          int
-	EncryptedData *commutative.Message
+	From int
+	Data []byte
 }
 
-// A Fn represents a state. Calling Fn with a message transitions into
-// a new state.
-type Fn func(m *Machine, msg Message) Fn
+// A Fn represents a state. Calling Fn transitions into the next state.
+type Fn func(m *Machine) Fn
 
 // Machine represents the game state machine.
 type Machine struct {
@@ -32,7 +32,9 @@ type Machine struct {
 	nextPlayer int // players are numbered 1..N
 	err        error
 
-	key *commutative.Key
+	ss    [][8]byte
+	hs    [][32]byte
+	order []int
 
 	debug bool
 }
@@ -40,42 +42,22 @@ type Machine struct {
 // Run runs the state machine until it terminates, returning a non-nil error if
 // execution failed.
 func (m *Machine) Run() error {
-	for state := m.Start(); state != nil; {
-		msg, ok := <-m.In
-		if !ok {
-			state = m.Fail(fmt.Errorf("expected more messages"))
-			continue
-		}
-		state = state(m, msg)
+	if m.NPlayers < MinPlayers {
+		return fmt.Errorf("too few players: got %d, want %d or more", m.NPlayers, MinPlayers)
+	}
+	if m.WhoAmI < 1 || m.WhoAmI > m.NPlayers {
+		return fmt.Errorf("invalid player identification: %d not in range [1,%d]", m.WhoAmI, m.NPlayers)
+	}
+	if m.In == nil {
+		return fmt.Errorf("m.In is nil")
+	}
+	if m.Out == nil {
+		return fmt.Errorf("m.Out is nil")
+	}
+	for state := stateGameplayOrder1PublishH; state != nil; {
+		state = state(m)
 	}
 	return m.Err()
-}
-
-// Start returns the initial state function of the machine.
-func (m *Machine) Start() Fn {
-	if m.NPlayers < MinPlayers {
-		return m.Fail(fmt.Errorf("too few players: got %d, want %d or more", m.NPlayers, MinPlayers))
-	}
-	m.nextPlayer = 1
-
-	// In a game with N players, the first player (in some implicit order)
-	// creates a slice of bytes with incremental values from 0 to N-1. Next,
-	// it shuffles and encrypts the bytes with a random key using
-	// commutative encryption.
-	if m.WhoAmI == m.nextPlayer {
-		p := make([]byte, m.NPlayers)
-		for i := range p {
-			p[i] = byte(i)
-		}
-		e := commutative.NewMessage(p)
-		m.key = shuffleEncrypt(e)
-		m.logf("Out <- % x", e.Bytes)
-		m.Out <- Message{
-			From:          m.WhoAmI,
-			EncryptedData: e,
-		}
-	}
-	return stateDecideGameplayOrder
 }
 
 // Err returns the error associated with this machine. A non-nil error means the
@@ -97,49 +79,117 @@ func (m *Machine) logf(format string, args ...interface{}) {
 	}
 }
 
-func stateDecideGameplayOrder(m *Machine, msg Message) Fn {
-	if msg.From != m.nextPlayer {
-		return m.Fail(fmt.Errorf("message from unexpected player: got %v, want %v", msg.From, m.nextPlayer))
-	}
-	if len(msg.EncryptedData.Bytes) != m.NPlayers {
-		return m.Fail(fmt.Errorf("encrypted data field: got %d bytes, want %d", len(msg.EncryptedData.Bytes), m.NPlayers))
-	}
-	m.logf("In -> % x", msg.EncryptedData.Bytes)
-	if m.key != nil && !m.key.CanDecrypt(msg.EncryptedData) {
-		// This error implies that the m.nextPlayer player somehow
-		// removed the encrytion nonce used with m.key, indicating a
-		// misbehavior (e.g. trying to manipulate the game state).
-		return m.Fail(fmt.Errorf("bad encrypted data: message cannot be decrypted"))
-	}
-
+func stateGameplayOrder1PublishH(m *Machine) Fn {
 	m.nextPlayer = m.nextPlayer%m.NPlayers + 1
-	if m.nextPlayer == 1 {
-		return stateDecideGameplayOrderRevealSecret
-	}
 
 	if m.WhoAmI == m.nextPlayer {
-		m.key = shuffleEncrypt(msg.EncryptedData)
-		m.logf("Out <- % x", msg.EncryptedData.Bytes)
+		var s [8]byte
+		if _, err := rand.Read(s[:]); err != nil {
+			return m.Fail(err)
+		}
+		h := blake2b.Sum256(s[:])
+		m.ss = append(m.ss, s)
+		m.hs = append(m.hs, h)
+		m.logf("Out <- %x", h)
 		m.Out <- Message{
-			From:          m.WhoAmI,
-			EncryptedData: msg.EncryptedData,
+			From: m.WhoAmI,
+			Data: h[:],
 		}
 	}
 
-	return stateDecideGameplayOrder
+	msg, ok := <-m.In
+	if !ok {
+		return m.Fail(fmt.Errorf("expected more messages"))
+	}
+	if msg.From != m.nextPlayer {
+		return m.Fail(fmt.Errorf("message from unexpected player: got %v, want %v", msg.From, m.nextPlayer))
+	}
+	m.logf("In -> %x", msg.Data)
+	var got [blake2b.Size256]byte
+	copy(got[:], msg.Data)
+
+	if msg.From == m.WhoAmI {
+		want := m.hs[m.WhoAmI-1]
+		if want != got {
+			return m.Fail(fmt.Errorf("corrupted message: want %x, got %x", want, got))
+		}
+	} else {
+		m.hs = append(m.hs, got)
+	}
+
+	if len(m.hs) == m.NPlayers {
+		return stateGameplayOrder2PublishS
+	}
+
+	return stateGameplayOrder1PublishH
 }
 
-func stateDecideGameplayOrderRevealSecret(m *Machine, msg Message) Fn {
-	return m.Fail(fmt.Errorf("state not implemented yet"))
+func stateGameplayOrder2PublishS(m *Machine) Fn {
+	m.nextPlayer = m.nextPlayer%m.NPlayers + 1
+
+	if m.WhoAmI == m.nextPlayer {
+		s := m.ss[m.WhoAmI-1]
+		m.logf("Out <- %x", s)
+		m.Out <- Message{
+			From: m.WhoAmI,
+			Data: s[:],
+		}
+	}
+
+	msg, ok := <-m.In
+	if !ok {
+		return m.Fail(fmt.Errorf("expected more messages"))
+	}
+	if msg.From != m.nextPlayer {
+		return m.Fail(fmt.Errorf("message from unexpected player: got %v, want %v", msg.From, m.nextPlayer))
+	}
+	m.logf("In -> %x", msg.Data)
+	var got [8]byte
+	copy(got[:], msg.Data)
+
+	if msg.From == m.WhoAmI {
+		want := m.ss[m.WhoAmI-1]
+		if want != got {
+			return m.Fail(fmt.Errorf("corrupted message: want %x, got %x", want, got))
+		}
+	} else {
+		if got, want := blake2b.Sum256(msg.Data), m.hs[msg.From-1]; got != want {
+			return m.Fail(fmt.Errorf("hash of %x does not match: got %x, want %x", msg.Data, got, want))
+		}
+		m.ss = append(m.ss, got)
+	}
+
+	if len(m.ss) == m.NPlayers {
+		return stateGameplayOrder3Compute
+	}
+
+	return stateGameplayOrder2PublishS
 }
 
-// shuffleEncrypt shuffles the bytes in m and encrypts them with a random key.
-// It mutates m and returns the key.
-func shuffleEncrypt(m *commutative.Message) *commutative.Key {
-	rand.Shuffle(len(m.Bytes), func(i int, j int) {
-		m.Bytes[i], m.Bytes[j] = m.Bytes[j], m.Bytes[i]
+func stateGameplayOrder3Compute(m *Machine) Fn {
+	t := blake2b.Sum256(xor(m.ss...))
+	m.order = m.order[:0]
+	for i := 1; i <= m.NPlayers; i++ {
+		m.order = append(m.order, i)
+	}
+	sort.SliceStable(m.order, func(i int, j int) bool {
+		return string(t[i*8:i*8+8]) < string(t[j*8:j*8+8])
 	})
-	key := commutative.GenerateKey()
-	key.Encrypt(m)
-	return key
+	m.logf("gameplay order: %v", m.order)
+	return stateShuffleTiles
+}
+
+func xor(ss ...[8]byte) []byte {
+	if len(ss) == 0 {
+		return nil
+	}
+	out := ss[0][:]
+	for i, s := range ss[1:] {
+		out[i] ^= s[i]
+	}
+	return out
+}
+
+func stateShuffleTiles(m *Machine) Fn {
+	return m.Fail(fmt.Errorf("state not implemented yet: waiting for Player #%d to shuffle tiles", m.order[0]))
 }
